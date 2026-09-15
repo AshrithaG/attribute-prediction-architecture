@@ -13,6 +13,7 @@ Scale figures are approximate and the design is what matters.
 
 - [The problem](#the-problem)
 - [How the system works](#how-the-system-works)
+- [The machine learning in detail](#the-machine-learning-in-detail)
 - [Architecture decisions](#architecture-decisions)
 - [What the measurements say](#what-the-measurements-say)
 - [Failure modes and edge cases](#failure-modes-and-edge-cases)
@@ -82,6 +83,133 @@ row carries reason codes and the neighbours that supported it.
 **Persistence.** Predictions, reviewer decisions and queue state are stored.
 The decision log is append-only. Staging is gated on a submission being fully
 reviewed.
+
+## The machine learning in detail
+
+### Representation
+
+A pretrained sentence encoder (BAAI bge-small-en-v1.5) maps each product
+description to a 384 dimensional vector. Vectors are L2 normalized, so an inner
+product is a cosine similarity. It runs on CPU in batches.
+
+The model is used off the shelf. Nothing is fine-tuned. A fine-tuning scaffold
+exists in the codebase but is not wired into the service, because fine-tuning
+needs labelled pairs the project does not have yet, and because any change to
+the encoder invalidates both the index and every value statistic built from it.
+That rebuild is the expensive step, so it is not something to do casually.
+
+The encoder revision is pinned. An unpinned model would quietly change the
+embeddings and leave the stored artifacts describing vectors that no longer
+exist.
+
+### Retrieval
+
+Catalog embeddings live in a FAISS IVFFlat index: an inverted file with 512
+Voronoi cells, trained on a sample of the catalog, searching 16 cells per query
+and returning the 50 nearest products under an inner product metric.
+
+Exact search would be accurate and unnecessary. The vote only needs the
+neighbourhood, not a perfectly ordered list, and the approximate index keeps a
+query in the low milliseconds on a CPU. Encoding the catalog is the slow part
+of a rebuild, on the order of an hour and a half of CPU time. Building the
+index from those vectors takes seconds.
+
+### Product type
+
+The 50 neighbours vote. The confidence is simply the winning type's share of
+the ballot. Above 0.80 is treated as high consensus, below 0.60 as ambiguous,
+which caps the downstream confidence at 0.75.
+
+The novelty gate is separate and deliberately measures something else: the
+similarity of the single closest product. Vote share and similarity answer
+different questions, and only the second one can tell you the catalog has never
+seen anything like this.
+
+### Value scoring
+
+Every combination of product type, attribute and value becomes a cluster of the
+embeddings of the products that use it. Each cluster stores a mean and a
+covariance estimated with Ledoit-Wolf shrinkage, which is what makes a
+covariance usable when the number of examples is close to the number of
+dimensions.
+
+A candidate value scores as
+
+```
+score = exp(-D^2 / (2 * sigma^2))
+```
+
+where `D^2` is the squared Mahalanobis distance from the query vector to that
+cluster, and `sigma` is a per product type temperature chosen by grid search on
+the validation split. Mahalanobis rather than Euclidean because a value whose
+examples are tightly grouped should punish a distant query harder than a value
+whose examples are spread out.
+
+Clusters with fewer than five members do not get an inverse covariance at all.
+They fall back to squared Euclidean distance and their confidence is capped.
+
+### The scale mismatch between those two branches
+
+This is the most interesting measurement in the project.
+
+Inverting a 384 by 384 covariance estimated from 8 to 28 points produces `D^2`
+in the thousands, while the identity branch is bounded near 0 to 4. On one
+product type the median was about 10,653 against 0.40, a factor of roughly
+26,600. After the exponential, every low sample cluster scores near 1.0 and
+every well estimated one scores near 0.0. The ranking is then decided by
+whether a cluster has fewer than five members, not by how similar anything is.
+Shrinkage does not close a gap that size at this ratio of samples to
+dimensions.
+
+Measured on held-out products, over 2,766 graded answers:
+
+| Candidate pool | n | Mahalanobis | Euclidean |
+| --- | --- | --- | --- |
+| All clusters the same kind | 1,627 | 76.8% | 53.8% |
+| Mixed kinds | 1,139 | 11.7% | 32.4% |
+
+Mahalanobis is much stronger on a uniform pool and collapses on a mixed one.
+Since ranking only ever happens within one attribute, the fix is to choose per
+attribute: Mahalanobis when that attribute's candidates are all the same kind,
+identity when the pool is mixed. That policy is implemented and selectable, and
+the default is left on the original behaviour so existing runs reproduce
+exactly. Changing a default is a decision for a release, not a side effect of
+learning something.
+
+### Rules
+
+Three tiers, tried in order. An exact part number match is terminal and skips
+the rest. A fuzzy manufacturer match uses a token set ratio with a minimum
+score, which tolerates word order and extra words. Numeric matching compares
+quantities and units. A guardrail rejects values that are not permitted for the
+attribute in question.
+
+Rules are not machine learning and that is the point. They are exact,
+explainable, and correct when they fire.
+
+### Combining the two
+
+```
+confidence = alpha * rule_score + (1 - alpha) * semantic_score
+```
+
+with alpha at 0.7, divided by the weight actually applied when one of the two
+signals does not exist. Routing thresholds sit on top of that number and are
+policy, not model output.
+
+### Evaluation protocol
+
+- The split is at the product level, stratified by product type, 80/10/10 with
+  a fixed seed. Splitting at row level would put one product's rows on both
+  sides and leak the description the encoder sees at evaluation time.
+- Product types with fewer than three products go entirely to training, since
+  they cannot supply both a validation and a test example.
+- Each query product is excluded from its own neighbour list, otherwise the
+  system retrieves itself and the metric measures memorization.
+- Reported: top-1 and top-3 accuracy, expected calibration error, Brier score,
+  and a threshold sweep of coverage against precision. The sweep is what makes
+  the auto accept threshold a decision with numbers behind it instead of a
+  guess.
 
 ## Architecture decisions
 
